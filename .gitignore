@@ -5,3 +5,6 @@ Logs
 Temp
 *.dwlt
 *.sln
+*.csproj
+.vs
+obj
