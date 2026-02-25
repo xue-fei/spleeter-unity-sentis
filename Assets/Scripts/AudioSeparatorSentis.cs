@@ -1,7 +1,9 @@
 using MathNet.Numerics;
 using MathNet.Numerics.IntegralTransforms;
 using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.Threading.Tasks;
 using Unity.InferenceEngine;
 using UnityEngine;
 
@@ -12,35 +14,30 @@ using UnityEngine;
 /// </summary>
 public class AudioSeparatorSentis : MonoBehaviour
 {
-    // 模型配置
     [SerializeField] private ModelAsset _vocalsModelAsset;
     [SerializeField] private ModelAsset _accompanimentModelAsset;
 
-    // STFT 参数
     private const int N_FFT = 4096;
     private const int HOP_LENGTH = 1024;
     private const int NUM_BINS = 2049;   // N_FFT/2 + 1
-    private const int MODEL_BINS = 1024;   // 模型输入的频率bins
-    private const int CHUNK_SIZE = 512;    // 模型处理的帧块大小（时间轴）
+    private const int MODEL_BINS = 1024;   // 模型输入的频率 bins
+    private const int CHUNK_SIZE = 512;    // 模型处理的时间帧块大小
     private const float EPSILON = 1e-10f;
 
     private int _sampleRate = 44100;
 
-    // InferenceEngine 资源
     private Worker _vocalsWorker;
     private Worker _accompanimentWorker;
     private Model _vocalsModel;
     private Model _accompanimentModel;
 
-    // 预分配缓冲区
+    // 预分配缓冲区（主线程专用）
     private float[] _hannWindow;
     private Complex32[] _fftBuffer;
-    private Complex32[] _ifftBuffer;
+    private Complex32[] _ifftBufferV;   // Vocals 专用
+    private Complex32[] _ifftBufferA;   // Accompaniment 专用
     private float[] _frameBuffer;
-
-    // 推理输入缓冲区（复用，避免每次 new）
-    // 形状对应 (2, 1, CHUNK_SIZE, MODEL_BINS)
-    private float[] _inferInputBuf;
+    private float[] _inferInputBuf;  // 推理输入复用缓冲
 
     private bool _isInitialized = false;
 
@@ -55,17 +52,18 @@ public class AudioSeparatorSentis : MonoBehaviour
             _vocalsModel = ModelLoader.Load(_vocalsModelAsset);
             _accompanimentModel = ModelLoader.Load(_accompanimentModelAsset);
 
-            _vocalsWorker = new Worker(_vocalsModel, BackendType.GPUCompute);
-            _accompanimentWorker = new Worker(_accompanimentModel, BackendType.GPUCompute);
+            _vocalsWorker = new Worker(_vocalsModel, BackendType.CPU);
+            _accompanimentWorker = new Worker(_accompanimentModel, BackendType.CPU);
 
             _hannWindow = CreateHannWindow(N_FFT);
             _fftBuffer = new Complex32[N_FFT];
-            _ifftBuffer = new Complex32[N_FFT];
+            _ifftBufferV = new Complex32[N_FFT];
+            _ifftBufferA = new Complex32[N_FFT];
             _frameBuffer = new float[N_FFT];
-            _inferInputBuf = new float[2 * CHUNK_SIZE * MODEL_BINS]; // 复用缓冲
+            _inferInputBuf = new float[2 * CHUNK_SIZE * MODEL_BINS];
 
             _isInitialized = true;
-            Debug.Log("✓ AudioSeparatorSentis 初始化成功 (InferenceEngine GPU)");
+            Debug.Log("✓ AudioSeparatorSentis 初始化成功");
         }
         catch (Exception ex)
         {
@@ -85,131 +83,162 @@ public class AudioSeparatorSentis : MonoBehaviour
     // ──────────────────────────────────────────────
 
     /// <summary>
-    /// 从 WAV 文件加载并分离
+    /// 协程方式分离（不阻塞主线程）
+    /// 用法: StartCoroutine(SeparateFromFileAsync(path, (results) => { ... }))
     /// </summary>
-    public Dictionary<string, float[]> SeparateFromFile(string audioPath)
-    {
-        try
-        {
-            float[] waveform = Util.LoadWavFile(audioPath, ref _sampleRate);
-            return Separate(waveform);
-        }
-        catch (Exception ex)
-        {
-            Debug.LogError($"文件分离失败: {ex.Message}");
-            throw;
-        }
-    }
-
-    /// <summary>
-    /// 分离立体声音频波形（44.1 kHz 16-bit PCM）
-    /// </summary>
-    /// <param name="waveform">交错立体声: [L0, R0, L1, R1, ...]</param>
-    /// <returns>{"vocals", "accompaniment"} 各为交错立体声</returns>
-    public Dictionary<string, float[]> Separate(float[] waveform)
+    public IEnumerator SeparateFromFileAsync(string audioPath,
+        Action<Dictionary<string, float[]>> onComplete,
+        Action<string> onError = null,
+        Action<float> onProgress = null)
     {
         if (!_isInitialized)
-            throw new InvalidOperationException("分离器未初始化，请检查模型资源");
-
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-
-        // ── 1. 解交错为左右声道 ──
-        int numSamples = waveform.Length / 2;
-        float[] left = new float[numSamples];
-        float[] right = new float[numSamples];
-        for (int i = 0; i < numSamples; i++)
         {
-            left[i] = waveform[i * 2];
-            right[i] = waveform[i * 2 + 1];
+            onError?.Invoke("分离器未初始化");
+            yield break;
         }
-        Debug.Log($"[1] 立体声解交错: {numSamples} 样本/通道");
 
-        // ── 2. STFT ──
-        var stftL = ComputeStft(left);
-        var stftR = ComputeStft(right);
-        var stftResults = new StftResult[2] { stftL, stftR };
-        int numFrames = stftL.NumFrames;
-        Debug.Log($"[2] STFT 完成: {numFrames} 帧");
+        // ── 步骤1：在后台线程加载 WAV 并计算 STFT（纯 CPU 密集，不涉及 Unity API）──
+        float[] waveform = null;
+        StftResult[] stftResults = null;
+        float[][][] stftMag = null;
+        int numFrames = 0, numSplits = 0, outputLength = 0;
+        string loadError = null;
 
-        // ── 3. 提取幅度谱 [2][numFrames][MODEL_BINS] ──
-        float[][][] stftMag = ExtractStftMagnitude(stftResults);
+        onProgress?.Invoke(0.05f);
+        var loadTask = Task.Run(() =>
+        {
+            try
+            {
+                waveform = Util.LoadWavFile(audioPath, ref _sampleRate);
 
-        // ── 4. 填充到 CHUNK_SIZE 整数倍 ──
-        int padding = (CHUNK_SIZE - (numFrames % CHUNK_SIZE)) % CHUNK_SIZE;
-        int paddedFrames = numFrames + padding;
-        if (padding > 0)
-            stftMag = PadStftData(stftMag, padding);
-        int numSplits = paddedFrames / CHUNK_SIZE;
-        Debug.Log($"[3] Padding: +{padding} 帧 → {paddedFrames} 帧, {numSplits} splits");
+                int ns = waveform.Length / 2;
+                float[] left = new float[ns];
+                float[] right = new float[ns];
+                for (int i = 0; i < ns; i++)
+                {
+                    left[i] = waveform[i * 2];
+                    right[i] = waveform[i * 2 + 1];
+                }
 
-        // ── 5. 预分配输出缓冲区（固定大小，与歌曲长度成正比但只分配一次）──
-        int outputLength = (numFrames - 1) * HOP_LENGTH + N_FFT;
+                // STFT 计算（不使用 Unity API，可在后台线程安全运行）
+                stftResults = new StftResult[2]
+                {
+                    ComputeStftBg(left),
+                    ComputeStftBg(right)
+                };
+
+                numFrames = stftResults[0].NumFrames;
+                stftMag = ExtractStftMagnitudeBg(stftResults);
+
+                int padding = (CHUNK_SIZE - (numFrames % CHUNK_SIZE)) % CHUNK_SIZE;
+                int padded = numFrames + padding;
+                if (padding > 0)
+                    stftMag = PadStftData(stftMag, padding);
+
+                numSplits = padded / CHUNK_SIZE;
+                outputLength = (numFrames - 1) * HOP_LENGTH + N_FFT;
+            }
+            catch (Exception ex)
+            {
+                loadError = ex.Message + "\n" + ex.StackTrace;
+            }
+        });
+
+        // 等待后台任务完成，同时不阻塞主线程
+        while (!loadTask.IsCompleted)
+            yield return null;
+
+        if (loadError != null)
+        {
+            onError?.Invoke($"加载/STFT 失败: {loadError}");
+            yield break;
+        }
+
+        Debug.Log($"[STFT] {numFrames} 帧, {numSplits} splits");
+        onProgress?.Invoke(0.20f);
+
+        // ── 步骤2：在主线程逐 split 推理（GPU Worker 必须在主线程调用）──
         float[][] vocalsOut = new float[2][] { new float[outputLength], new float[outputLength] };
         float[][] accompOut = new float[2][] { new float[outputLength], new float[outputLength] };
-        float[][] windowSums = new float[2][] { new float[outputLength], new float[outputLength] };
+        float[][] windowSumsV = new float[2][] { new float[outputLength], new float[outputLength] };
+        float[][] windowSumsA = new float[2][] { new float[outputLength], new float[outputLength] };
 
-        // ── 6. 流式推理：逐 split 推理 → 立即 ISTFT 累加 ──
         var tensorShape = new TensorShape(2, 1, CHUNK_SIZE, MODEL_BINS);
 
         for (int splitIdx = 0; splitIdx < numSplits; splitIdx++)
         {
-            // 填充推理输入（复用 _inferInputBuf）
             FillInputBuffer(stftMag, splitIdx);
 
-            // 推理（两个模型共用同一输入缓冲，顺序执行）
             float[] vocalRaw = RunSingleSplit(_vocalsWorker, tensorShape);
             float[] accompRaw = RunSingleSplit(_accompanimentWorker, tensorShape);
 
             if (vocalRaw == null || accompRaw == null)
             {
-                Debug.LogWarning($"split {splitIdx} 推理返回空结果，跳过");
-                continue;
+                Debug.LogWarning($"split {splitIdx} 推理返回空，跳过");
             }
-
-            // 立即计算 Wiener 掩码 + ISTFT + 叠加到输出缓冲
-            AccumulateISTFT(vocalRaw, accompRaw, stftResults, splitIdx,
-                            numFrames, vocalsOut, accompOut, windowSums);
-
-            if (splitIdx % 10 == 0)
-                Debug.Log($"  推理进度: {splitIdx + 1}/{numSplits}");
-        }
-
-        // ── 7. 重叠相加归一化 ──
-        for (int ch = 0; ch < 2; ch++)
-        {
-            for (int i = 0; i < outputLength; i++)
+            else
             {
-                float w = windowSums[ch][i];
-                if (w > 1e-6f)
-                {
-                    vocalsOut[ch][i] /= w;
-                    accompOut[ch][i] /= w;
-                }
+                AccumulateISTFT(vocalRaw, accompRaw, stftResults, splitIdx, numFrames,
+                                vocalsOut, accompOut, windowSumsV, windowSumsA);
+            }
+
+            // 每处理一个 split 让出一帧，避免主线程卡死
+            if (splitIdx % 2 == 0)
+            {
+                float prog = 0.20f + 0.70f * (splitIdx + 1f) / numSplits;
+                onProgress?.Invoke(prog);
+                yield return null;
             }
         }
-        Debug.Log("[7] 归一化完成");
 
-        // ── 8. 交错输出为立体声 ──
+        // ── 步骤3：后台归一化（大数组遍历，放后台）──
+        bool normalizesDone = false;
+        Task.Run(() =>
+        {
+            NormalizeOutput(vocalsOut, windowSumsV, outputLength);
+            NormalizeOutput(accompOut, windowSumsA, outputLength);
+            normalizesDone = true;
+        });
+        while (!normalizesDone)
+            yield return null;
+
+        onProgress?.Invoke(0.95f);
+
         var results = new Dictionary<string, float[]>
         {
             ["vocals"] = InterleaveChannels(vocalsOut[0], vocalsOut[1]),
             ["accompaniment"] = InterleaveChannels(accompOut[0], accompOut[1])
         };
 
-        sw.Stop();
-        float dur = numSamples / (float)_sampleRate;
-        Debug.Log($"✓ 分离完成 | 耗时: {sw.ElapsedMilliseconds} ms | RTF: {sw.ElapsedMilliseconds / 1000f / dur:F3}");
-        return results;
+        onProgress?.Invoke(1.0f);
+        Debug.Log("✓ 音频分离完成");
+        onComplete?.Invoke(results);
+    }
+
+    /// <summary>
+    /// 同步接口（小文件或编辑器工具使用，会阻塞）
+    /// </summary>
+    public Dictionary<string, float[]> SeparateFromFile(string audioPath)
+    {
+        Dictionary<string, float[]> result = null;
+        string error = null;
+        bool done = false;
+
+        var coroutine = SeparateFromFileAsync(audioPath,
+            r => { result = r; done = true; },
+            e => { error = e; done = true; });
+
+        // 手动驱动协程（同步模拟，仅供非 MonoBehaviour 场景）
+        while (coroutine.MoveNext()) { }
+
+        if (error != null) throw new Exception(error);
+        return result;
     }
 
     // ──────────────────────────────────────────────
-    //  推理核心
+    //  推理（必须在主线程）
     // ──────────────────────────────────────────────
 
-    /// <summary>
-    /// 将第 splitIdx 个 split 的幅度谱写入 _inferInputBuf
-    /// 布局: [ch, time, freq]，对应张量形状 (2, 1, CHUNK_SIZE, MODEL_BINS)
-    /// </summary>
     private void FillInputBuffer(float[][][] stftMag, int splitIdx)
     {
         for (int ch = 0; ch < 2; ch++)
@@ -220,21 +249,13 @@ public class AudioSeparatorSentis : MonoBehaviour
                 int frameIdx = splitIdx * CHUNK_SIZE + time;
                 int timeOffset = chOffset + time * MODEL_BINS;
                 if (frameIdx < stftMag[ch].Length)
-                {
-                    float[] src = stftMag[ch][frameIdx];
-                    Array.Copy(src, 0, _inferInputBuf, timeOffset, MODEL_BINS);
-                }
+                    Array.Copy(stftMag[ch][frameIdx], 0, _inferInputBuf, timeOffset, MODEL_BINS);
                 else
-                {
                     Array.Clear(_inferInputBuf, timeOffset, MODEL_BINS);
-                }
             }
         }
     }
 
-    /// <summary>
-    /// 用当前 _inferInputBuf 内容执行单次推理，立即释放 tensor，返回输出数组
-    /// </summary>
     private float[] RunSingleSplit(Worker worker, TensorShape shape)
     {
         Tensor<float> inputTensor = null;
@@ -244,7 +265,6 @@ public class AudioSeparatorSentis : MonoBehaviour
             inputTensor = new Tensor<float>(shape, _inferInputBuf);
             worker.SetInput("x", inputTensor);
             worker.Schedule();
-
             outputTensor = worker.PeekOutput("y") as Tensor<float>;
             return outputTensor?.DownloadToArray();
         }
@@ -261,155 +281,43 @@ public class AudioSeparatorSentis : MonoBehaviour
     }
 
     // ──────────────────────────────────────────────
-    //  STFT / ISTFT
+    //  STFT（后台线程版，不使用任何 Unity API）
     // ──────────────────────────────────────────────
 
-    private StftResult ComputeStft(float[] signal)
+    /// <summary>后台线程安全的 STFT（独立缓冲，不共享主线程缓冲）</summary>
+    private StftResult ComputeStftBg(float[] signal)
     {
         int numFrames = (signal.Length - N_FFT) / HOP_LENGTH + 1;
         float[] realPart = new float[numFrames * NUM_BINS];
         float[] imagPart = new float[numFrames * NUM_BINS];
+        float[] frame = new float[N_FFT];
+        Complex32[] fftBuf = new Complex32[N_FFT];
 
-        for (int frameIdx = 0; frameIdx < numFrames; frameIdx++)
+        for (int fi = 0; fi < numFrames; fi++)
         {
-            int offset = frameIdx * HOP_LENGTH;
-
+            int offset = fi * HOP_LENGTH;
             for (int i = 0; i < N_FFT; i++)
             {
-                int sIdx = offset + i;
-                _frameBuffer[i] = sIdx < signal.Length ? signal[sIdx] * _hannWindow[i] : 0f;
+                int si = offset + i;
+                frame[i] = si < signal.Length ? signal[si] * _hannWindow[i] : 0f;
             }
-
             for (int i = 0; i < N_FFT; i++)
-                _fftBuffer[i] = new Complex32(_frameBuffer[i], 0f);
+                fftBuf[i] = new Complex32(frame[i], 0f);
 
-            Fourier.Forward(_fftBuffer, FourierOptions.Matlab);
+            Fourier.Forward(fftBuf, FourierOptions.Matlab);
 
-            int baseIdx = frameIdx * NUM_BINS;
+            int baseIdx = fi * NUM_BINS;
             for (int k = 0; k < NUM_BINS; k++)
             {
-                realPart[baseIdx + k] = _fftBuffer[k].Real;
-                imagPart[baseIdx + k] = _fftBuffer[k].Imaginary;
+                realPart[baseIdx + k] = fftBuf[k].Real;
+                imagPart[baseIdx + k] = fftBuf[k].Imaginary;
             }
         }
-
         return new StftResult { Real = realPart, Imag = imagPart, NumFrames = numFrames };
     }
 
-    /// <summary>
-    /// 对单个 split 的推理输出计算 Wiener 掩码，并将 ISTFT 结果叠加到输出缓冲区
-    /// 不分配任何持久中间数组，内存使用量为 O(1)
-    /// </summary>
-    private void AccumulateISTFT(
-        float[] vocalRaw,
-        float[] accompRaw,
-        StftResult[] stftResults,
-        int splitIdx,
-        int numFrames,
-        float[][] vocalsOut,
-        float[][] accompOut,
-        float[][] windowSums)
-    {
-        int outputLength = vocalsOut[0].Length;
-        int startFrame = splitIdx * CHUNK_SIZE;
-        int endFrame = Mathf.Min(startFrame + CHUNK_SIZE, numFrames);
-
-        for (int ch = 0; ch < 2; ch++)
-        {
-            StftResult stft = stftResults[ch];
-            int chOff = ch * CHUNK_SIZE * MODEL_BINS;
-
-            for (int localTime = 0; localTime < endFrame - startFrame; localTime++)
-            {
-                int frameIdx = startFrame + localTime;
-                int offset = frameIdx * HOP_LENGTH;
-                int stftBase = frameIdx * NUM_BINS;
-                int rawBase = chOff + localTime * MODEL_BINS;
-
-                // ── Vocals IFFT ──
-                for (int k = 0; k < NUM_BINS; k++)
-                {
-                    if (k < MODEL_BINS)
-                    {
-                        int ri = rawBase + k;
-                        float vs = ri < vocalRaw.Length ? vocalRaw[ri] : 0f;
-                        float as_ = ri < accompRaw.Length ? accompRaw[ri] : 0f;
-                        float vs2 = vs * vs, as2 = as_ * as_;
-                        float vm = (vs2 + EPSILON * 0.5f) / (vs2 + as2 + EPSILON);
-                        _ifftBuffer[k] = new Complex32(
-                            stft.Real[stftBase + k] * vm,
-                            stft.Imag[stftBase + k] * vm);
-                    }
-                    else
-                    {
-                        _ifftBuffer[k] = new Complex32(
-                            stft.Real[stftBase + k],
-                            stft.Imag[stftBase + k]);
-                    }
-                }
-                FillConjugateSymmetry();
-                Fourier.Inverse(_ifftBuffer, FourierOptions.Matlab);
-                for (int i = 0; i < N_FFT && offset + i < outputLength; i++)
-                {
-                    float w = _hannWindow[i];
-                    vocalsOut[ch][offset + i] += _ifftBuffer[i].Real * w;
-                    windowSums[ch][offset + i] += w * w;   // windowSum 只累加一次
-                }
-
-                // ── Accompaniment IFFT ──
-                for (int k = 0; k < NUM_BINS; k++)
-                {
-                    if (k < MODEL_BINS)
-                    {
-                        int ri = rawBase + k;
-                        float vs = ri < vocalRaw.Length ? vocalRaw[ri] : 0f;
-                        float as_ = ri < accompRaw.Length ? accompRaw[ri] : 0f;
-                        float vs2 = vs * vs, as2 = as_ * as_;
-                        float am = (as2 + EPSILON * 0.5f) / (vs2 + as2 + EPSILON);
-                        _ifftBuffer[k] = new Complex32(
-                            stft.Real[stftBase + k] * am,
-                            stft.Imag[stftBase + k] * am);
-                    }
-                    else
-                    {
-                        _ifftBuffer[k] = new Complex32(
-                            stft.Real[stftBase + k],
-                            stft.Imag[stftBase + k]);
-                    }
-                }
-                FillConjugateSymmetry();
-                Fourier.Inverse(_ifftBuffer, FourierOptions.Matlab);
-                for (int i = 0; i < N_FFT && offset + i < outputLength; i++)
-                    accompOut[ch][offset + i] += _ifftBuffer[i].Real * _hannWindow[i];
-                // accomp 与 vocals 共用 windowSums，不重复累加
-            }
-        }
-    }
-
-    private void FillConjugateSymmetry()
-    {
-        for (int k = NUM_BINS; k < N_FFT; k++)
-        {
-            int conjIdx = N_FFT - k;
-            _ifftBuffer[k] = conjIdx < NUM_BINS
-                ? Complex32.Conjugate(_ifftBuffer[conjIdx])
-                : Complex32.Zero;
-        }
-    }
-
-    // ──────────────────────────────────────────────
-    //  辅助方法
-    // ──────────────────────────────────────────────
-
-    private float[] CreateHannWindow(int length)
-    {
-        var w = new float[length];
-        for (int i = 0; i < length; i++)
-            w[i] = 0.5f * (1f - Mathf.Cos(2f * Mathf.PI * i / (length - 1)));
-        return w;
-    }
-
-    private float[][][] ExtractStftMagnitude(StftResult[] stftResults)
+    /// <summary>后台线程安全的幅度谱提取（不使用 Mathf）</summary>
+    private float[][][] ExtractStftMagnitudeBg(StftResult[] stftResults)
     {
         var result = new float[2][][];
         for (int ch = 0; ch < 2; ch++)
@@ -420,15 +328,136 @@ public class AudioSeparatorSentis : MonoBehaviour
             {
                 result[ch][i] = new float[MODEL_BINS];
                 int idx = i * NUM_BINS;
-                for (int k = 0; k < MODEL_BINS && k < NUM_BINS; k++)
+                for (int k = 0; k < MODEL_BINS; k++)
                 {
                     float r = stftResults[ch].Real[idx + k];
                     float im = stftResults[ch].Imag[idx + k];
-                    result[ch][i][k] = Mathf.Sqrt(r * r + im * im);
+                    result[ch][i][k] = (float)Math.Sqrt(r * r + im * im);
                 }
             }
         }
         return result;
+    }
+
+    // ──────────────────────────────────────────────
+    //  ISTFT + Wiener 掩码叠加
+    // ──────────────────────────────────────────────
+
+    /// <summary>
+    /// 核心修复点：
+    /// 1. vocals 和 accompaniment 使用各自独立的 windowSums，归一化互不干扰
+    /// 2. k >= MODEL_BINS 的高频部分置零（不保留原始信号，避免串音）
+    /// 3. vocals 和 accompaniment 的 IFFT 缓冲互相独立（_ifftBufferV / _ifftBufferA）
+    /// </summary>
+    private void AccumulateISTFT(
+        float[] vocalRaw,
+        float[] accompRaw,
+        StftResult[] stftResults,
+        int splitIdx,
+        int numFrames,
+        float[][] vocalsOut,
+        float[][] accompOut,
+        float[][] windowSumsV,
+        float[][] windowSumsA)
+    {
+        int outputLength = vocalsOut[0].Length;
+        int startFrame = splitIdx * CHUNK_SIZE;
+        int endFrame = Math.Min(startFrame + CHUNK_SIZE, numFrames);
+
+        for (int ch = 0; ch < 2; ch++)
+        {
+            StftResult stft = stftResults[ch];
+            int chOff = ch * CHUNK_SIZE * MODEL_BINS;
+
+            for (int lt = 0; lt < endFrame - startFrame; lt++)
+            {
+                int frameIdx = startFrame + lt;
+                int offset = frameIdx * HOP_LENGTH;
+                int stftBase = frameIdx * NUM_BINS;
+                int rawBase = chOff + lt * MODEL_BINS;
+
+                // ── 计算 Wiener 掩码并同时填充两个 IFFT 缓冲 ──
+                for (int k = 0; k < NUM_BINS; k++)
+                {
+                    if (k < MODEL_BINS)
+                    {
+                        int ri = rawBase + k;
+                        float vs = ri < vocalRaw.Length ? vocalRaw[ri] : 0f;
+                        float ac = ri < accompRaw.Length ? accompRaw[ri] : 0f;
+                        float vs2 = vs * vs;
+                        float ac2 = ac * ac;
+                        float denom = vs2 + ac2 + EPSILON;
+
+                        // 修复：vocals 掩码 + accompaniment 掩码，两者之和 ≈ 1
+                        float vm = (vs2 + EPSILON * 0.5f) / denom;
+                        float am = (ac2 + EPSILON * 0.5f) / denom;
+
+                        float re = stft.Real[stftBase + k];
+                        float im = stft.Imag[stftBase + k];
+
+                        _ifftBufferV[k] = new Complex32(re * vm, im * vm);
+                        _ifftBufferA[k] = new Complex32(re * am, im * am);
+                    }
+                    else
+                    {
+                        // 修复：高频置零，不让原始信号泄漏到分离输出中
+                        _ifftBufferV[k] = Complex32.Zero;
+                        _ifftBufferA[k] = Complex32.Zero;
+                    }
+                }
+
+                // ── 填充共轭对称 ──
+                FillConjugateSymmetry(_ifftBufferV);
+                FillConjugateSymmetry(_ifftBufferA);
+
+                // ── IFFT ──
+                Fourier.Inverse(_ifftBufferV, FourierOptions.Matlab);
+                Fourier.Inverse(_ifftBufferA, FourierOptions.Matlab);
+
+                // ── 重叠相加（vocals 和 accompaniment 各自独立累加）──
+                for (int i = 0; i < N_FFT && offset + i < outputLength; i++)
+                {
+                    float w = _hannWindow[i];
+                    float w2 = w * w;
+
+                    vocalsOut[ch][offset + i] += _ifftBufferV[i].Real * w;
+                    accompOut[ch][offset + i] += _ifftBufferA[i].Real * w;
+
+                    // 修复：各自独立的 windowSum，归一化互不影响
+                    windowSumsV[ch][offset + i] += w2;
+                    windowSumsA[ch][offset + i] += w2;
+                }
+            }
+        }
+    }
+
+    private void FillConjugateSymmetry(Complex32[] buf)
+    {
+        for (int k = NUM_BINS; k < N_FFT; k++)
+        {
+            int ci = N_FFT - k;
+            buf[k] = ci < NUM_BINS ? Complex32.Conjugate(buf[ci]) : Complex32.Zero;
+        }
+    }
+
+    // ──────────────────────────────────────────────
+    //  辅助方法
+    // ──────────────────────────────────────────────
+
+    private static void NormalizeOutput(float[][] output, float[][] windowSums, int length)
+    {
+        for (int ch = 0; ch < 2; ch++)
+            for (int i = 0; i < length; i++)
+                if (windowSums[ch][i] > 1e-6f)
+                    output[ch][i] /= windowSums[ch][i];
+    }
+
+    private float[] CreateHannWindow(int length)
+    {
+        var w = new float[length];
+        for (int i = 0; i < length; i++)
+            w[i] = 0.5f * (1f - (float)Math.Cos(2.0 * Math.PI * i / (length - 1)));
+        return w;
     }
 
     private float[][][] PadStftData(float[][][] data, int padding)
@@ -449,7 +478,7 @@ public class AudioSeparatorSentis : MonoBehaviour
     private float[] InterleaveChannels(float[] left, float[] right)
     {
         int len = Math.Max(left.Length, right.Length);
-        var stereo = new float[len * 2];
+        float[] stereo = new float[len * 2];
         for (int i = 0; i < len; i++)
         {
             stereo[i * 2] = i < left.Length ? left[i] : 0f;
